@@ -229,12 +229,20 @@ dark preview). HTML export always uses the light stylesheets.
                 position: fixed;
                 inset: 0;
                 z-index: 99999;
-                display: none;
+                display: flex;
                 align-items: center;
                 justify-content: center;
                 background: var(--overlay-bg);
-                /* Visual only — must not steal dragenter/leave or the overlay flickers off */
+                visibility: hidden;
+                opacity: 0;
+                /* Visual only — must not steal dragenter/leave or the overlay flickers off.
+                   Stay in the layout (do not toggle display). Firefox on Linux cancels
+                   the drag when a covering box is inserted mid-drag. */
                 pointer-events: none;
+            }
+            #dropOverlay.is-visible {
+                visibility: visible;
+                opacity: 1;
             }
             #dropMessage {
                 padding:
@@ -697,10 +705,32 @@ dark preview). HTML export always uses the light stylesheets.
             #viewer.markdown-body pre > code,
             #viewer.markdown-body pre code.hljs {
                 display: block;
+                position: relative;
+                z-index: 1;
                 padding: 0;
                 margin: 0;
                 font-size: 100%;
                 background: transparent;
+            }
+            #viewer.markdown-body pre .code-line-highlights {
+                position: absolute;
+                z-index: 0;
+                top: var(--base-size-16);
+                right: 0;
+                left: 0;
+                pointer-events: none;
+            }
+            #viewer.markdown-body pre .code-line-slot {
+                display: block;
+                height: 1.45em;
+            }
+            #viewer.markdown-body pre .code-line-highlight {
+                background-color: rgba(9, 105, 218, 0.16);
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+            }
+            #viewerPane[data-preview-theme="dark"] #viewer.markdown-body pre .code-line-highlight {
+                background-color: rgba(56, 139, 253, 0.28);
             }
             .code-copy-btn {
                 position: absolute;
@@ -1318,6 +1348,7 @@ The toolbar uses dropdown menus. Settings toggles appear as inline buttons.
 # Drag and Drop
 - Drag a file anywhere on the page to show the Drop File overlay
 - Drop loads the first file from the transfer
+- Opening or dropping a file scrolls the viewer to the top when the viewer is visible
 - Binary files are rejected with a warning
 - Non-Markdown text files open with syntax coloring when the file extension maps to a loaded language; otherwise as plain text
 - Markdown is detected by file extension (.md, .markdown)
@@ -1365,6 +1396,7 @@ footer: Internal Use Only
 - Each code fence has a copy icon floating in the top-right of the box; it copies the fence contents and briefly shows a Copied cue
 - Code fences and non-Markdown files (by extension) use highlight.js
 - A code fence with no language is plain text
+- A fence may include a line range after the language, such as \`\`\`js {2,4-5}\`\`\`. Those lines are marked for every language. A fence with only the range stays plain text
 - File extensions map to languages/aliases (e.g. .py → python, .cs → csharp); unknown or unloaded languages fall back to plain text
 - Use Highlight on the toolbar or in **Settings ▼** to force a language (or Markdown) until the next file is loaded; unknown extensions stay plain text on load
 - **Supported languages:** ${languageList}
@@ -1425,7 +1457,7 @@ function hello() {
             let externalImageWarningShown = false;
             let isPlainTextFile = false;
             let highlightLanguageOverride = HIGHLIGHT_MODE_AUTO;
-            let dragCounter = 0;
+            let dropOverlayTimer = 0;
             /* ============================================================
             * DOM References
             * ============================================================ */
@@ -1615,9 +1647,28 @@ line-height:1.45;
 }
 ${selector} pre>code,${selector} pre code.hljs{
 display:block;
+position:relative;
+z-index:1;
 padding:0;
 margin:0;
 font-size:100%;
+}
+${selector} pre .code-line-highlights{
+position:absolute;
+z-index:0;
+top:var(--base-size-16);
+right:0;
+left:0;
+pointer-events:none;
+}
+${selector} pre .code-line-slot{
+display:block;
+height:1.45em;
+}
+${selector} pre .code-line-highlight{
+background-color:rgba(9,105,218,0.16);
+-webkit-print-color-adjust:exact;
+print-color-adjust:exact;
 }`;
             }
             function applyViewerFontSize() {
@@ -2025,11 +2076,129 @@ font-size:100%;
             /* ============================================================
             * Marked / Front Matter
             * ============================================================ */
+            let markedCodeRendererInstalled = false;
             function syncMarkedOptions() {
                 marked.setOptions({
                     gfm: true,
                     breaks: settings.showLineBreaks
                 });
+                installMarkedCodeRenderer();
+            }
+            /**
+             * Reads a fence info string. The first word is the language.
+             * A brace group such as {2,4-5} is the line range, for any language.
+             *
+             * @param {string} info
+             * @returns {{language:string,lines:string}}
+             */
+            function parseFenceInfo(info) {
+                const raw = String(info || "").trim();
+                let lines = "";
+                let rest = raw;
+                const match = raw.match(/\{([^}]*)\}/);
+                if (match) {
+                    const compact = match[1].replace(/\s+/g, "");
+                    if (/^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$/.test(compact)) {
+                        lines = compact;
+                        rest = (
+                            raw.slice(0, match.index) +
+                            " " +
+                            raw.slice(match.index + match[0].length)
+                        ).trim();
+                    }
+                }
+                const language = rest ? rest.split(/\s+/)[0] : "";
+                return { language, lines };
+            }
+            /**
+             * @param {string} spec
+             * @returns {Array<[number,number]>}
+             */
+            function parseHighlightRanges(spec) {
+                const ranges = [];
+                String(spec || "").split(",").forEach(part => {
+                    if (!part) {
+                        return;
+                    }
+                    const bits = part.split("-");
+                    if (bits.length === 1) {
+                        const n = Number(bits[0]);
+                        if (Number.isInteger(n) && n > 0) {
+                            ranges.push([n, n]);
+                        }
+                        return;
+                    }
+                    if (bits.length !== 2) {
+                        return;
+                    }
+                    let start = Number(bits[0]);
+                    let end = Number(bits[1]);
+                    if (
+                        !Number.isInteger(start) ||
+                        !Number.isInteger(end) ||
+                        start < 1 ||
+                        end < 1
+                    ) {
+                        return;
+                    }
+                    if (end < start) {
+                        const swap = start;
+                        start = end;
+                        end = swap;
+                    }
+                    ranges.push([start, end]);
+                });
+                return ranges;
+            }
+            /**
+             * @param {Array<[number,number]>} ranges
+             * @param {number} lineNumber
+             * @returns {boolean}
+             */
+            function highlightRangeHits(ranges, lineNumber) {
+                for (let i = 0; i < ranges.length; i++) {
+                    if (lineNumber >= ranges[i][0] && lineNumber <= ranges[i][1]) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            /**
+             * Keeps fence line-range metadata that Marked would otherwise drop.
+             * Installed once. Later setOptions calls do not replace it.
+             */
+            function installMarkedCodeRenderer() {
+                if (
+                    markedCodeRendererInstalled ||
+                    typeof marked === "undefined" ||
+                    typeof marked.use !== "function"
+                ) {
+                    return;
+                }
+                const original = new marked.Renderer().code;
+                marked.use({
+                    renderer: {
+                        code(token) {
+                            const parsed = parseFenceInfo(token && token.lang);
+                            if (!parsed.lines) {
+                                return original.call(this, token);
+                            }
+                            const text = token.text
+                                ? token.text.replace(/\n$/, "") + "\n"
+                                : "";
+                            const body = token.escaped ? text : escapeHtml(text);
+                            const classAttr = parsed.language
+                                ? ` class="language-${escapeHtml(parsed.language)}"`
+                                : "";
+                            return (
+                                `<pre><code${classAttr}` +
+                                ` data-highlight-lines="${parsed.lines}">` +
+                                `${body}</code></pre>\n`
+                            );
+                        }
+                    }
+                });
+                markedCodeRendererInstalled = true;
             }
             function parseFrontMatter(text) {
                 if (!text) {
@@ -2494,6 +2663,49 @@ font-size:100%;
                     quote.replaceWith(alert);
                 }
             }
+            /**
+             * Paints fence lines named by data-highlight-lines.
+             * The code text stays in place, so copy is unchanged.
+             *
+             * @param {HTMLElement} block
+             */
+            function applyFenceLineHighlights(block) {
+                const spec = block.getAttribute("data-highlight-lines");
+                if (!spec) {
+                    return;
+                }
+                const pre = block.parentElement;
+                if (!pre || pre.tagName !== "PRE") {
+                    return;
+                }
+                const previous = pre.querySelector(":scope > .code-line-highlights");
+                if (previous) {
+                    previous.remove();
+                }
+                const ranges = parseHighlightRanges(spec);
+                if (!ranges.length) {
+                    return;
+                }
+                let text = block.textContent || "";
+                if (text.endsWith("\n")) {
+                    text = text.slice(0, -1);
+                }
+                const lineCount = text ? text.split("\n").length : 0;
+                if (!lineCount) {
+                    return;
+                }
+                const overlay = document.createElement("div");
+                overlay.className = "code-line-highlights";
+                overlay.setAttribute("aria-hidden", "true");
+                for (let line = 1; line <= lineCount; line++) {
+                    const slot = document.createElement("span");
+                    slot.className = highlightRangeHits(ranges, line)
+                        ? "code-line-slot code-line-highlight"
+                        : "code-line-slot";
+                    overlay.appendChild(slot);
+                }
+                pre.insertBefore(overlay, block);
+            }
             function applyCodeHighlighting() {
                 viewer
                     .querySelectorAll("pre code")
@@ -2505,6 +2717,7 @@ font-size:100%;
                         } catch (err) {
                             console.error(err);
                         }
+                        applyFenceLineHighlights(block);
                     });
             }
             const CODE_COPY_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M10.5 1.5h-7A1.5 1.5 0 0 0 2 3v9h1.25V3a.25.25 0 0 1 .25-.25h7V1.5zm2 3h-7A1.5 1.5 0 0 0 4 6v8.5A1.5 1.5 0 0 0 5.5 16h7a1.5 1.5 0 0 0 1.5-1.5V6a1.5 1.5 0 0 0-1.5-1.5zM12.5 14.75h-7a.25.25 0 0 1-.25-.25V6a.25.25 0 0 1 .25-.25h7a.25.25 0 0 1 .25.25v8.5a.25.25 0 0 1-.25.25z"/></svg>`;
@@ -3317,23 +3530,113 @@ font-size:100%;
                 );
             }
             /**
+             * Lower-cased drag types. Empty when the browser hides them.
+             * Firefox on Linux often reports application/x-moz-file or a
+             * URI list instead of Files, and sometimes an empty list until drop.
+             *
+             * @param {DragEvent} event
+             * @returns {string[]}
+             */
+            function dragTypeList(event) {
+                const types = event.dataTransfer && event.dataTransfer.types;
+                if (!types || !types.length) {
+                    return [];
+                }
+                return Array.prototype.slice.call(types).map(
+                    type => String(type).toLowerCase()
+                );
+            }
+            /**
              * True when the drag event carries files from the OS.
              *
              * @param {DragEvent} event
              * @returns {boolean}
              */
             function isFileDrag(event) {
-                const types = event.dataTransfer && event.dataTransfer.types;
-                if (!types) {
+                if (!event.dataTransfer) {
                     return false;
                 }
-                if (typeof types.includes === "function") {
-                    return types.includes("Files");
+                const types = dragTypeList(event);
+                if (!types.length) {
+                    return true;
                 }
-                if (typeof types.contains === "function") {
-                    return types.contains("Files");
+                if (
+                    types.indexOf("files") !== -1 ||
+                    types.indexOf("application/x-moz-file") !== -1
+                ) {
+                    return true;
                 }
-                return Array.from(types).indexOf("Files") !== -1;
+                const uriList = (
+                    types.indexOf("text/uri-list") !== -1 ||
+                    types.indexOf("text/x-moz-url") !== -1
+                );
+                const html = types.indexOf("text/html") !== -1;
+                return uriList && !html;
+            }
+            /**
+             * True when the drag types name a file, not merely an empty list.
+             *
+             * @param {DragEvent} event
+             * @returns {boolean}
+             */
+            function isDeclaredFileDrag(event) {
+                const types = dragTypeList(event);
+                return (
+                    types.indexOf("files") !== -1 ||
+                    types.indexOf("application/x-moz-file") !== -1 ||
+                    types.indexOf("text/uri-list") !== -1 ||
+                    types.indexOf("text/x-moz-url") !== -1
+                );
+            }
+            /**
+             * First file on a drop. Firefox may expose it only via items.
+             *
+             * @param {DragEvent} event
+             * @returns {File|null}
+             */
+            function fileFromDrop(event) {
+                const transfer = event.dataTransfer;
+                if (!transfer) {
+                    return null;
+                }
+                if (transfer.files && transfer.files.length) {
+                    return transfer.files[0];
+                }
+                const items = transfer.items;
+                if (!items) {
+                    return null;
+                }
+                for (let i = 0; i < items.length; i++) {
+                    const item = items[i];
+                    if (item.kind !== "file") {
+                        continue;
+                    }
+                    const file = item.getAsFile();
+                    if (file) {
+                        return file;
+                    }
+                }
+                return null;
+            }
+            /**
+             * True when the viewer pane is on screen (not Editor Full).
+             *
+             * @returns {boolean}
+             */
+            function isViewerVisible() {
+                return !!(
+                    viewerPane &&
+                    viewerPane.getClientRects().length
+                );
+            }
+            /**
+             * Scrolls the preview to the top when the viewer is visible.
+             */
+            function scrollViewerToTopIfVisible() {
+                if (!isViewerVisible() || !viewerContainer) {
+                    return;
+                }
+                viewerContainer.scrollTop = 0;
             }
             /**
              * Reads the first portion of a file for text/binary probing.
@@ -3458,6 +3761,11 @@ font-size:100%;
                     setLoadedFilename(file.name);
                     codeMirror.setValue(text);
                     renderMarkdown();
+                    scrollViewerToTopIfVisible();
+                    setTimeout(
+                        scrollViewerToTopIfVisible,
+                        (settings.autoRefreshDelay || 0) + 20
+                    );
                 } catch (err) {
                     console.error(err);
                     alert("Unable to read file.");
@@ -3467,10 +3775,53 @@ font-size:100%;
                 fileInput.click();
             }
             function showDropOverlay() {
-                dropOverlay.style.display = "flex";
+                dropOverlay.classList.add("is-visible");
+                window.clearTimeout(dropOverlayTimer);
+                /* dragover can be sparse on Firefox; hide only after it stops. */
+                dropOverlayTimer = window.setTimeout(hideDropOverlay, 500);
             }
             function hideDropOverlay() {
-                dropOverlay.style.display = "none";
+                window.clearTimeout(dropOverlayTimer);
+                dropOverlayTimer = 0;
+                dropOverlay.classList.remove("is-visible");
+            }
+            function onFileDragEnter(event) {
+                if (!isFileDrag(event)) {
+                    return;
+                }
+                event.preventDefault();
+                if (event.dataTransfer) {
+                    event.dataTransfer.dropEffect = "copy";
+                }
+                showDropOverlay();
+            }
+            function onFileDragOver(event) {
+                if (!isFileDrag(event)) {
+                    return;
+                }
+                event.preventDefault();
+                if (event.dataTransfer) {
+                    event.dataTransfer.dropEffect = "copy";
+                }
+                showDropOverlay();
+            }
+            async function onFileDrop(event) {
+                const file = fileFromDrop(event);
+                if (!file && !isFileDrag(event)) {
+                    return;
+                }
+                event.preventDefault();
+                event.stopPropagation();
+                hideDropOverlay();
+                if (!file) {
+                    if (isDeclaredFileDrag(event)) {
+                        notify.warning(
+                            "The browser did not provide the dropped file. Use File → Open File."
+                        );
+                    }
+                    return;
+                }
+                await loadMarkdownFile(file);
             }
             /* ============================================================
             * Export
@@ -3986,63 +4337,9 @@ ${buildExportPageScript()}
                 "resize",
                 () => { if (codeMirror) { codeMirror.refresh(); } }
             );
-            document.addEventListener(
-                "dragenter",
-                event => {
-                    if (!isFileDrag(event)) {
-                        return;
-                    }
-                    event.preventDefault();
-                    dragCounter++;
-                    showDropOverlay();
-                },
-                true
-            );
-            document.addEventListener(
-                "dragover",
-                event => {
-                    if (!isFileDrag(event)) {
-                        return;
-                    }
-                    event.preventDefault();
-                    if (event.dataTransfer) {
-                        event.dataTransfer.dropEffect = "copy";
-                    }
-                    showDropOverlay();
-                },
-                true
-            );
-            document.addEventListener(
-                "dragleave",
-                event => {
-                    if (!isFileDrag(event)) {
-                        return;
-                    }
-                    event.preventDefault();
-                    dragCounter--;
-                    if (dragCounter <= 0) {
-                        dragCounter = 0;
-                        hideDropOverlay();
-                    }
-                },
-                true
-            );
-            document.addEventListener(
-                "drop",
-                async event => {
-                    if (!isFileDrag(event)) {
-                        return;
-                    }
-                    event.preventDefault();
-                    event.stopPropagation();
-                    dragCounter = 0;
-                    hideDropOverlay();
-                    const file = event.dataTransfer?.files?.[0];
-                    if (!file) return;
-                    await loadMarkdownFile(file);
-                },
-                true
-            );
+            window.addEventListener("dragenter", onFileDragEnter, true);
+            window.addEventListener("dragover", onFileDragOver, true);
+            window.addEventListener("drop", onFileDrop, true);
             [
                 ["menuOpen", openFileDialog],
                 ["menuSaveAs", saveAsEditorContent],

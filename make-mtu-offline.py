@@ -11,17 +11,17 @@ Requirements:
     - Network access to fetch CDN assets
 
 Usage:
-    python make-mtu-offline.py 1.0.0
-    python make-mtu-offline.py 1.0.0 --input dist/mitey-text-utility-100.html
-    python make-mtu-offline.py 1.0.0 --output dist/mitey-text-utility-100-offline.html
-    python make-mtu-offline.py 1.0.0 --timeout 60 --retries 5
+    python make-mtu-offline.py 1.0.2
+    python make-mtu-offline.py 1.0.2 --input dist/mitey-text-utility-102.html
+    python make-mtu-offline.py 1.0.2 --output dist/mitey-text-utility-102-offline.html
+    python make-mtu-offline.py 1.0.2 --timeout 60 --retries 5
 
 The version is required and must be the first argument. Dots are removed
-to build the dist file name. Version 1.0.0 copies:
-    mitey-text-utility.html -> dist/mitey-text-utility-100.html
+to build the dist file name. Version 1.0.2 copies:
+    mitey-text-utility.html -> dist/mitey-text-utility-102.html
 Then that copy is the default input. The default output appends -offline
 to the input file name:
-    dist/mitey-text-utility-100-offline.html
+    dist/mitey-text-utility-102-offline.html
 --input and --output replace those defaults only when you pass them.
 
 Tags already inlined (with a data-source attribute) are left unchanged. To
@@ -360,14 +360,14 @@ def version_token(version: str) -> str:
     """
     Turn a dotted version into the digits used in dist file names.
 
-    Example: 1.0.0 -> 100
+    Example: 1.0.2 -> 102
 
     Raises:
         ValidationError: If the version is not numbers separated by dots.
     """
     if not VERSION_PATTERN.fullmatch(version):
         raise ValidationError(
-            "Version must be numbers separated by dots, for example 1.0.0."
+            "Version must be numbers separated by dots, for example 1.0.2."
         )
     return version.replace(".", "")
 
@@ -376,7 +376,7 @@ def copied_dist_path(version: str) -> Path:
     """
     Return the versioned copy path under ./dist.
 
-    Example: 1.0.0 -> dist/mitey-text-utility-100.html
+    Example: 1.0.2 -> dist/mitey-text-utility-102.html
     """
     token = version_token(version)
     return DIST_DIR / f"{OUTPUT_STEM}-{token}.html"
@@ -419,14 +419,14 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
             "into an offline HTML file."
         ),
         epilog=(
-            "Example: python make-mtu-offline.py 1.0.0 "
-            "copies dist/mitey-text-utility-100.html and writes "
-            "dist/mitey-text-utility-100-offline.html"
+            "Example: python make-mtu-offline.py 1.0.2 "
+            "copies dist/mitey-text-utility-102.html and writes "
+            "dist/mitey-text-utility-102-offline.html"
         ),
     )
     parser.add_argument(
         "version",
-        help="Version number, for example 1.0.0 (required, first argument)",
+        help="Version number, for example 1.0.2 (required, first argument)",
     )
     parser.add_argument(
         "-i",
@@ -489,6 +489,7 @@ def main(argv: List[str] | None = None) -> int:
             )
         copy_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source_path, copy_path)
+        print(f"Copied source HTML to {copy_path}.")
 
         input_path = Path(args.input) if args.input else copy_path
         output_path = Path(args.output) if args.output else offline_path_for(input_path)
@@ -499,8 +500,13 @@ def main(argv: List[str] | None = None) -> int:
             timeout=args.timeout,
             retries=args.retries,
         )
+        print(f"Bundled {input_path}.")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(offline_html, encoding="utf-8", newline="\n")
+        print(
+            f"Wrote offline HTML to {output_path} "
+            f"({len(offline_html):,} bytes, {unique_urls} unique URLs inlined)."
+        )
     except OfflineBundlerError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return exc.exit_code
@@ -508,12 +514,6 @@ def main(argv: List[str] | None = None) -> int:
         print(f"Error writing output file: {exc}", file=sys.stderr)
         return 3
 
-    print(f"Copied source HTML to {copy_path}.")
-    print(f"Bundled {input_path}.")
-    print(
-        f"Wrote offline HTML to {output_path} "
-        f"({len(offline_html):,} bytes, {unique_urls} unique URLs inlined)."
-    )
     return 0
 
 
